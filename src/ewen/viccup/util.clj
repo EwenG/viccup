@@ -1,5 +1,5 @@
 (ns ewen.viccup.util
-  "Utility functions for Viccup."
+  "Utility functions for Hiccup."
   (:require [clojure.string :as str])
   (:import java.net.URI
            java.net.URLEncoder))
@@ -38,14 +38,6 @@
   nil
   (to-str [_] ""))
 
-(defmulti to-attr-val
-  (fn [{op :op tag :tag}] [op tag]))
-
-(defmethod to-attr-val [:constant 'cljs.core/Symbol] [{form :form}] form)
-
-(defmethod to-attr-val :default [{form :form}]
-  (.toLowerCase (to-str form)))
-
 (defn ^String as-str
   "Converts its arguments into a string using to-str."
   [& xs]
@@ -60,20 +52,15 @@
   String
   (to-uri [s] (URI. s)))
 
-(defprotocol EscapeHTML
-  (escape-html [x]))
-
-(extend-protocol EscapeHTML
-  clojure.lang.Symbol
-  (escape-html [sym] `(escape-html ~sym))
-  Object
-  (escape-html [text]
-    (.. ^String (as-str text)
-        (replace "&"  "&amp;")
-        (replace "<"  "&lt;")
-        (replace ">"  "&gt;")
-        (replace "\"" "&quot;")
-        (replace "'" (if (= *html-mode* :sgml) "&#39;" "&apos;")))))
+(defn escape-html
+  "Change special characters into HTML character entities."
+  [text]
+  (.. ^String (as-str text)
+    (replace "&"  "&amp;")
+    (replace "<"  "&lt;")
+    (replace ">"  "&gt;")
+    (replace "\"" "&quot;")
+    (replace "'" (if (= *html-mode* :sgml) "&#39;" "&apos;"))))
 
 (def ^:dynamic *encoding* "UTF-8")
 
