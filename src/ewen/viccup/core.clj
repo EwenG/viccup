@@ -82,15 +82,20 @@
       (not-hint? x java.util.Map)))
 
 (defn format-attribute [[name value]]
-  (let [name (.toLowerCase (as-str name))]
+  (let [name (to-attr-val name)]
     (if-not value
       `()
-      `(~(str name) ~(escape-html value)))))
+      `(~name ~(escape-html (to-attr-val value))))))
 
-(defn render-attr-map [attrs]
-  (->> (map format-attribute attrs)
-       (apply concat)
-       (cons 'cljs.core/js-array)))
+(defn render-attr-map [id class {children :children}]
+  (let [id-and-class (cond
+                       (and id class) `(("id" ~id) ("class" ~class))
+                       id `(("id" ~id))
+                       class `(("class" ~class)))]
+    (->> (map format-attribute (partition 2 children))
+         (into id-and-class)
+         (apply concat)
+         (cons 'cljs.core/js-array))))
 
 (defn- merge-attributes [{:keys [id class]} map-attrs]
   (->> map-attrs
@@ -100,19 +105,22 @@
 (defn normalize-element
   "Ensure an element vector is of the form [tag-name attrs content]."
   [[tag & content]]
-  (when (not (or (keyword? tag) (symbol? tag) (string? tag) (fn? tag)))
+  (when (not (or (keyword? tag) (symbol? tag) (string? tag)))
+    (throw (IllegalArgumentException. (str tag " is not a valid element name."))))
+  (let [[_ tag id class] (re-matches re-tag (as-str tag))
+        tag-attrs        {:id id
+                          :class (if class (.replace ^String class "." " "))}
+        map-attrs        (first content)]
+    (if (map? map-attrs)
+      [tag (merge-attributes tag-attrs map-attrs) (next content)]
+      [tag tag-attrs content])))
+
+(defn normalize-tag [tag]
+  (when (not (or (keyword? tag) (symbol? tag) (string? tag)))
     (throw (IllegalArgumentException.
             (str tag " is not a valid element name."))))
-  (if (fn? tag)
-    [tag {} content]
-    (let [[_ tag id class] (re-matches re-tag (as-str tag))
-          tag-attrs        {:id id
-                            :class (if class
-                                     (.replace ^String class "." " "))}
-          map-attrs        (first content)]
-      (if (map? map-attrs)
-        [tag (merge-attributes tag-attrs map-attrs) (next content)]
-        [tag tag-attrs content]))))
+  (let [[_ tag id class] (re-matches re-tag (as-str tag))]
+    [tag id (if class (.replace ^String class "." " "))]))
 
 (defprotocol HtmlRenderer
   (render-html [this]))
@@ -163,31 +171,128 @@
 
 (declare compile-seq)
 
-(defmulti compile-element-static
-  (fn [{:keys [op] :as ast-node}]
-    (let [{first-op :op first-tag :tag} (first (:children ast-node))
-          {second-op :op second-tag :tag} (second (:children ast-node))]
-      (cond
-        (= op :constant)
-        [:constant]
-        (and (= op :vector)
-             (or (= 'cljs.core/Keyword first-tag)
-                 (= 'string first-tag)
-                 (= 'cljs.core/Symbol first-tag))
-             (or (not (second (:children ast-node)))
-                 (= :constant second-op)
-                 (= :map second-op)
-                 (= :vector second-op)))
-        [:node :all-literal]
-        :else [:default]))))
+(defmulti compile-invoke
+  (fn [{[{fn-name :form}] :children}]
+    (if fn-name
+      [fn-name]
+      [:default])))
+
+(defmethod compile-invoke [:default]
+  [{:keys [form]}]
+  `(render-html ~form))
+
+(defn compile-element-static-strategy
+  [{op :op form :form {locals :locals} :env
+    [{first-op :op first-tag :tag}
+     {second-op :op second-tag :tag }
+     :as children] :children}]
+  (cond
+    (= op :constant)
+    [:constant]
+    (= op :invoke)
+    [:invoke]
+    (= op :do)
+    [:do]
+    (= op :let)
+    [:let]
+    (and (= op :var))
+    [:var]
+    (and (= op :vector)
+         (or (= 'cljs.core/Keyword first-tag)
+             (= 'string first-tag)
+             (= 'cljs.core/Symbol first-tag))
+         (or (not (second children))
+             (= :constant second-op)
+             (= :vector second-op)))
+    [:node :no-attrs]
+    (and (= op :vector)
+         (or (= 'cljs.core/Keyword first-tag)
+             (= 'string first-tag)
+             (= 'cljs.core/Symbol first-tag))
+         (= :map second-op))
+    [:node :literal-attrs]
+    (and (= op :vector)
+         (or (= 'cljs.core/Keyword first-tag)
+             (= 'string first-tag)
+             (= 'cljs.core/Symbol first-tag)))
+    [:node :literal-tag]
+    :else [:default]))
+
+(defmulti compile-element-static compile-element-static-strategy)
 
 (defmethod compile-element-static [:constant]
   [{:keys [form]}]
   (render-html form))
 
-(defmethod compile-element-static [:node :all-literal]
+(defmethod compile-element-static [:invoke]
+  [node]
+  (compile-invoke node))
+
+(defmethod compile-element-static [:do]
+  [{:keys [statements ret]}]
+  (doseq [s statements]
+     (compile-element-static s))
+  (compile-element-static ret))
+
+(defmethod compile-element-static [:let]
+  [{bindings :bindings expr :expr}]
+  `(let ~(->> (mapcat (fn [binding]
+                        [(compile-element-static binding)
+                         (compile-element-static (:init binding))])
+                      bindings)
+              (into []))
+     ~(compile-element-static expr)))
+
+(defmethod compile-element-static [:var]
+  [{{name :name} :info}] name)
+
+(defmethod compile-element-static [:node :no-attrs]
+  [{[tag] :form children :children}]
+  (let [[tag id class] (normalize-tag tag)]
+    (let [attrs (render-attr-map id class nil)
+          node `(goog.dom.createdom ~tag ~attrs)
+          node-sym (gensym "node-sym")]
+      `(let [~node-sym ~node]
+         (goog.dom.append
+          ~node-sym
+          (~'js-array
+           ~@(map compile-element-static (drop 1 children))))
+         ~node-sym))))
+
+(defmethod compile-element-static [:node :literal-attrs]
+  [{[tag] :form [{} attrs :as children] :children}]
+  (let [[tag id class] (normalize-tag tag)]
+    (let [attrs (render-attr-map id class attrs)
+          node `(goog.dom.createdom ~tag ~attrs)
+          node-sym (gensym "node-sym")]
+      `(let [~node-sym ~node]
+         (goog.dom.append
+          ~node-sym
+          (~'js-array
+           ~@(map compile-element-static (drop 2 children))))
+         ~node-sym))))
+
+(defmethod compile-element-static [:node :literal-tag]
+  [{:keys [form children]}]
+  (let [[tag attrs _] form
+        [tag id class] (normalize-tag tag)
+        attrs-sym       (gensym "attrs")
+        attrs `(let [~attrs-sym ~attrs]
+                 (if (map? ~attrs-sym)
+                   (render-attr-map ~id ~class ~attrs-sym)
+                   (render-attr-map ~id ~class)))
+        node `(goog.dom.createDom ~tag ~attrs)
+        node-sym (gensym "node-sym")]
+    `(let [~node-sym ~node]
+       (goog.dom.append
+        ~node-sym
+        (~'js-array
+         ~@(map compile-element-static (drop 2 children))))
+       ~node-sym)))
+
+(defmethod compile-element-static [:default]
   [{:keys [form]}]
-  (render-element form))
+  `(render-html ~form))
 
 (defmulti emit-dynamic (fn [{:keys [op tag]}] [op tag]))
 (defmethod emit-dynamic [:constant 'cljs.core/Symbol]
@@ -323,7 +428,7 @@
    :params '[x y]
    :ast {}
    :dynamic-nodes {}}
-
+[(if true [:div] [:p])]
   (render-html [:div])
 
   (:op (ana-api/analyze (ana-api/empty-env) [:div]))
@@ -333,4 +438,24 @@
 
   (if (vector? x)
     )
+
+  [:div (if x [:p] [:span y])]
+
+  (let [x [[[:e] "f"] [:e "r"]]
+        y x
+        x (assoc-in x [0 1] "r")]
+    (prn x)
+    (prn y)
+    (identical? (get-in x [0 0]) (get-in y [0 0])))
+
+  [:div (if x [:p "e"] (if y [:span "e"] [:img]))]
+  )
+
+(comment
+  '[:e {} e]
+
+  (let [val '[:div {} [:e {} e]]
+        e "s"]
+    (if (string? e)
+      (assoc-in val [2 2] e)))
   )
